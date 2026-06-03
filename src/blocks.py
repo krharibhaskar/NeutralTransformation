@@ -1,0 +1,249 @@
+import torch
+import torch.nn as nn
+
+from norm import AdaptiveInstanceNorm
+from functions import get_padding_layer
+from functions import get_activation_layer
+from functions import get_norm_layer
+from functions import spectral_norm
+
+class ConvBlock(nn.Module):
+    """Convolution block containing conv, norm layer and activation layer"""
+    def __init__(self, input_dim:int,
+                       output_dim:int,
+                       kernel_size:int,
+                       stride:int = 1,
+                       padding:int = 0,
+                       bias:bool = False,
+                       norm_layer:str = None,
+                       activation:str = None,
+                       padding_type:str = None,
+                       sn:bool = False):
+        super(ConvBlock, self).__init__()
+        self.block = nn.ModuleList()
+        # add padding, norm and activation layers if passed
+        padding_layer = get_padding_layer(padding_type)
+        activation = get_activation_layer(activation)
+        norm_layer = get_norm_layer(norm_layer)
+        # add layers to block
+        if padding_layer is not None:
+            self.block.append(padding_layer(padding))
+            padding = 0
+        # add conv layer
+        if sn:
+            self.block.append(spectral_norm(nn.Conv2d(input_dim, output_dim, kernel_size, stride, padding, bias=bias)))
+            ###############################
+            
+            ###############################
+        else:
+            self.block.append(nn.Conv2d(input_dim, output_dim, kernel_size, stride, padding, bias=bias))
+        # add norm layer
+        if norm_layer is not None:
+            self.block.append(norm_layer(output_dim))
+        # add activation
+        if activation is not None:
+            self.block.append(activation())
+        self.block = nn.Sequential(*self.block)
+
+    def forward(self, x):
+        return self.block(x)
+
+class UpsampleBlock(nn.Module):
+    """Transpopse Convolution block containing transpose conv, norm layer and activation layer"""
+    def __init__(self, input_dim:int,
+                       output_dim:int,
+                       kernel_size:int,
+                       stride:int = 1,
+                       padding:int = 0,
+                       output_padding:int = 0,
+                       bias:bool = False,
+                       norm_layer:str = None,
+                       activation:str = None,
+                       padding_type:str = None,
+                       sn:bool = False,
+                       up_type:str = 'transpose'):
+        super(UpsampleBlock, self).__init__()
+        self.block = []
+        # add padding, norm and activation layers if passed
+        padding_type = get_padding_layer(padding_type)
+        activation = get_activation_layer(activation)
+        norm_layer = get_norm_layer(norm_layer)
+        # add layers to block
+        if 'transpose' in up_type:
+            if sn:
+                self.block += [spectral_norm(nn.ConvTranspose2d(input_dim, output_dim, kernel_size, stride, padding, output_padding, bias=bias))]
+            else:
+                self.block += [nn.ConvTranspose2d(input_dim, output_dim, kernel_size, stride, padding, output_padding, bias=bias)]
+        elif 'nearest' in up_type:
+            self.block += [nn.Upsample(scale_factor=2, mode='nearest'),
+                    ConvBlock(input_dim, output_dim, kernel_size, 1, padding, padding_type=padding_type, bias=bias, sn=sn)]
+        elif 'pixelshuffle' in up_type:
+            self.block += [ConvBlock(input_dim, output_dim, kernel_size, 1, padding, padding_type=padding_type, bias=bias, sn=sn),
+                           nn.PixelShuffle(2)]
+        else:
+            raise NotImplementedError(f"Mode {up_type} is not supported at the moment")
+        # add norm layer
+        if norm_layer is not None:
+            self.block += [norm_layer(output_dim)]
+        # add activation
+        if activation is not None:
+            self.block += [activation()]
+        self.block = nn.Sequential(*self.block)
+
+    def forward(self, x):
+        return self.block(x)
+
+class DownResnetBlock(nn.Module):
+    """Basic resnet type block with short cut convolution connection"""
+    def __init__(self, input_dim:int,
+                       output_dim:int,
+                       norm_layer:str = 'instance',
+                       activation:str = 'lrelu',
+                       padding_type:str = 'reflect',
+                       bias:bool = True):
+        super(DownResnetBlock, self).__init__()
+        self.conv = nn.ModuleList()
+        if isinstance(norm_layer, str):
+            norm_layer = get_norm_layer(norm_layer)
+        if isinstance(activation, str):
+            activation = get_activation_layer(activation)
+        if norm_layer is not None:
+            self.conv.append(norm_layer(input_dim))
+        self.conv.append(activation())
+        self.conv.append(ConvBlock(input_dim, input_dim, 3, 1, padding=1, padding_type=padding_type,
+                                    norm_layer=norm_layer, activation=activation, bias=bias))
+        self.conv.append(ConvBlock(input_dim, output_dim, 3, 1, padding=1, padding_type=padding_type, bias=bias))
+        self.conv.append(nn.AvgPool2d(kernel_size=2, stride=2))
+        self.conv = nn.Sequential(*self.conv)
+        #self.shortcut = nn.Sequential(*[nn.AvgPool2d(kernel_size=2, stride=2),
+         #                               nn.Conv2d(input_dim, output_dim, 1, 1, 0, bias=bias)])
+        self.shortcut = nn.ModuleList()
+        self.shortcut.append(nn.AvgPool2d(kernel_size=2, stride=2))
+        self.shortcut.append(nn.Conv2d(input_dim, output_dim, 1, 1, 0, bias=bias))
+        self.shortcut = nn.Sequential(*self.shortcut)
+
+    def forward(self, x):
+        return self.conv(x) + self.shortcut(x)
+
+class ResnetBlock(nn.Module):
+    """resnet block"""
+    def __init__(self, input_dim:int,
+                       output_dim:int,
+                       dropout:bool = False,
+                       norm_layer:str = 'instance',
+                       padding_type:str = 'reflect',
+                       activation:str = 'relu',
+                       pad = False):
+        super(ResnetBlock, self).__init__()
+        self.model = nn.ModuleList()
+        if pad == False:
+            self.model.append(ConvBlock(input_dim, output_dim, 3, 1, 1, padding_type=padding_type, norm_layer=norm_layer, activation=activation))
+            self.model.append(ConvBlock(output_dim, output_dim, 3, 1, 1, padding_type=padding_type, norm_layer=norm_layer))
+        if pad == True:
+            #self.model.append(nn.ZeroPad2d((270,270,406,406)))
+            #self.model.append(nn.ZeroPad2d((540,0,0,0)))
+            
+            self.model.append(ConvBlock(input_dim, output_dim, 3, 1, 1, padding_type=padding_type, norm_layer=norm_layer, activation=activation))
+            #self.model.append(nn.ZeroPad2d((0,0,812,0)))
+            self.model.append(ConvBlock(output_dim, output_dim, 3, 1, (1, 1, 1, 1), padding_type=padding_type, norm_layer=norm_layer))
+            #self.model.append(ConvBlock(output_dim, output_dim, 3, 1, 1, padding_type=padding_type, norm_layer=norm_layer))
+        if dropout:
+            self.model.append(nn.Dropout(0.5))
+        self.model = nn.Sequential(*self.model)
+
+    def forward(self, x):
+        return x + self.model(x)
+    
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, downsample):
+        super().__init__()
+        if downsample:
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            self.shortcut = nn.Sequential()
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        shortcut = self.shortcut(x)
+        x = nn.ReLU()(self.bn1(self.conv1(x)))
+        x = nn.ReLU()(self.bn2(self.conv2(x)))
+        x = x + shortcut
+        return nn.ReLU()(x)
+
+class AdaINResnetBlock(nn.Module):
+    """resnet block"""
+    def __init__(self, input_dim:int,
+                       output_dim:int,
+                       dropout:bool = False,
+                       style_dim:int = 256,
+                       padding_type:str = 'reflect',
+                       activation:str = 'relu'):
+        super(AdaINResnetBlock, self).__init__()
+        self.activation = get_activation_layer(activation)()
+        self.conv1 = ConvBlock(input_dim, output_dim, 3, 1, 1, padding_type=padding_type)
+        self.conv2 = ConvBlock(output_dim, output_dim, 3, 1, 1, padding_type=padding_type)
+        self.norm = AdaptiveInstanceNorm(output_dim, style_dim)
+        if dropout:
+            self.dropout = nn.Dropout(0.5)
+        else:
+            self.dropout = nn.Identity()
+
+    def forward(self, x, z):
+        residual = x
+        x = self.conv1(x)
+        x = self.norm(x, z)
+        x = self.activation(x)
+        x = self.conv2(x)
+        x = self.norm(x, z)
+        x = self.dropout(x)
+        x += residual
+        return x
+
+class DecResnetBlock(nn.Module):
+    def __init__(self, n_channel:int,
+                       add_channel:int,
+                       norm_layer:str = 'instance',
+                       padding_type:str = 'reflect',
+                       stride:int = 1,
+                       dropout:bool = False):
+        super(DecResnetBlock, self).__init__()
+        self.conv1 = ConvBlock(n_channel, n_channel, 3, stride=stride, padding=1, padding_type=padding_type)
+        self.conv2 = ConvBlock(n_channel, n_channel, 3, stride=stride, padding=1, padding_type=padding_type)
+        self.norm = get_norm_layer(norm_layer)(n_channel)
+        self.block1 = nn.ModuleList()
+        self.block1.append(nn.Conv2d(n_channel + add_channel, n_channel + add_channel, 1, stride=stride, padding=0))
+        self.block1.append(nn.ReLU())
+        self.block1.append(nn.Conv2d(n_channel + add_channel, n_channel, 1, stride=1, padding=0))
+        self.block1.append(nn.ReLU())
+        self.block1 = nn.Sequential(*self.block1)
+        self.block2 = nn.ModuleList()
+        self.block2.append(nn.Conv2d(n_channel + add_channel, n_channel + add_channel, 1, stride=1, padding=0))
+        self.block2.append(nn.ReLU())
+        self.block2.append(nn.Conv2d(n_channel + add_channel, n_channel, 1, stride=1, padding=0))
+        self.block2.append(nn.ReLU())
+        self.block2 = nn.Sequential(*self.block2)
+        if dropout:
+            self.dropout = nn.Dropout(0.5)
+        else:
+            self.dropout = nn.Identity()
+
+    def forward(self, x, z):
+        residual = x
+        z_expand = z.view(z.size(0), z.size(1), 1, 1).expand(z.size(0), z.size(1), x.size(2), x.size(3))
+        out = self.conv1(x)
+        out = self.norm(out)
+        out = self.block1(torch.cat([out, z_expand], dim=1))
+        out = self.conv2(out)
+        out = self.norm(out)
+        out = self.block2(torch.cat([out, z_expand], dim=1))
+        out = self.dropout(out)
+        out += residual
+        return out
